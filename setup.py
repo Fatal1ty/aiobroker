@@ -5,7 +5,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="aiobroker",
-    version="0.2",
+    version="0.3",
     description="Message broker for the communication between the components",
     platforms="all",
     classifiers=[

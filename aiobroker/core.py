@@ -1,108 +1,183 @@
 import asyncio
-import logging
-from collections import defaultdict
+from uuid import uuid4
+from typing import DefaultDict, Dict, List, Any, Hashable, Callable, Optional
 
-from .common import short_type_name
-from .queue import DynamicBoundedManualAcknowledgeQueue
+from aiobroker.exceptions import ExchangeDoesNotExist
+from aiobroker.queue import DynamicBoundedManualAcknowledgeQueue as Queue
+from aiobroker.queue import ConsumerTag, RANDOM_NAME, UNLIMITED
+
+
+Subscriber = Callable[[Any], Any]
+ExchangeName = str
+RoutingKey = Hashable
+Queues = Dict[RoutingKey, Queue]
+Exchanges = DefaultDict[ExchangeName, Queues]
+Subscribers = DefaultDict[ExchangeName, Dict[RoutingKey, List[Subscriber]]]
+Notifiers = DefaultDict[ExchangeName, Dict[RoutingKey, asyncio.Future]]
+
+
+DEFAULT = 'default'
+
+
+class Consumer:
+
+    __slots__ = ('exchange', 'key', 'queue')
+
+    def __init__(self, exchange: 'Exchange', key: Hashable, queue: Queue):
+        self.exchange = exchange
+        self.key = key
+        self.queue = queue
+
+
+class Exchange:
+    def __init__(self, name: str):
+        self.name: str = name
+        self.queues: Dict[Hashable, List[Queue]] = {}
+
+    async def publish(self, msg: Any, key: Optional[Hashable] = None):
+        if key is None:
+            key = type(msg)
+        queues = self.queues.get(key, ())
+        if queues:
+            coros = [queue.put(msg) for queue in queues]
+            await asyncio.gather(*coros)
+
+    def publish_nowait(self, msg: Any, key: Optional[Hashable] = None):
+        if key is None:
+            key = type(msg)
+        queues = self.queues.get(key, ())
+        for queue in queues:
+            queue.put_nowait(msg)
+
+    def bind_queue(self, key: Hashable, queue: Queue):
+        for existing_queue in self.queues.setdefault(key, []):
+            if existing_queue.name == queue.name:
+                return
+        else:
+            self.queues[key].append(queue)
+
+    def unbind_queue(self, key: Hashable, queue: Queue):
+        existing_queues = self.queues.get(key, [])
+        if existing_queues:
+            existing_queues.remove(queue)
+
+    # def get_queue(self, key: Hashable, name: str) -> Optional[Queue]:
+    #     for queue in self.queues.get(key, ()):
+    #         if queue.name == name:
+    #             return queue
+
+    def release(self):
+        self.queues = {}
 
 
 class Broker:
     def __init__(self):
-        self.exchanges = defaultdict(dict)
-        self.subscribers = defaultdict(dict)
-        self.notifiers = defaultdict(dict)
-        self.notify_tasks = set()
+        self.exchanges: Dict[Hashable, Exchange] = {}
+        self.queues: Dict[Hashable, Queue] = {}
+        self.consumers: Dict[ConsumerTag, Consumer] = {}
 
-        self.__is_stopping = False
-        self.log = logging.getLogger('message-broker')
+    def add_consumer(self,
+                     key: Hashable,
+                     consumer: Callable[[Any], Any],
+                     auto_ack: bool = True,
+                     queue_name: str = RANDOM_NAME,
+                     exchange_name: str = DEFAULT,
+                     max_queue_size: int = UNLIMITED,
+                     prefetch_count: int = UNLIMITED,
+                     auto_delete: bool = True,
+                     ttl: int = None,
+                     flow_control: bool = True,
+                     on_error: Optional[Callable[[Exception], Any]] = None) \
+            -> ConsumerTag:
 
-    async def stop(self):
-        self.__is_stopping = True
-        for exchange in self.notifiers.values():
-            for notifier in exchange.values():
-                notifier.cancel()
-        for notify_task in self.notify_tasks:
-            notify_task.cancel()
-        self.log.debug('Message broker stopped')
+        # TODO: отдавать сущность Consumer, через которую можно отменять
+        exchange = self.declare_exchange(exchange_name)
+        queue = self.declare_queue(
+            name=queue_name or str(uuid4()),
+            prefetch_count=prefetch_count,
+            auto_delete=auto_delete,
+            maxsize=max_queue_size,
+            ttl=ttl,
+            flow_control=flow_control,
+        )
+        exchange.bind_queue(key, queue)
+        consumer_tag = queue.basic_consume(consumer, auto_ack, on_error)
+        self.consumers[consumer_tag] = Consumer(exchange, key, queue)
+        return consumer_tag
 
-    def is_stopping(self):
-        return self.__is_stopping
+    def cancel_consumer(self, tag: ConsumerTag):
+        consumer = self.consumers.pop(tag, None)
+        if consumer:
+            queue = consumer.queue
+            queue.basic_cancel(tag)
+            if queue.auto_delete and queue.consumers_count == 0:
+                self.queues.pop(queue.name, None)
+                consumer.exchange.unbind_queue(consumer.key, queue)
 
-    def subscribe(self, subscriber, key, exchange='default', maxsize=0,
-                  flow_control=True):
-        subscribers = self.subscribers[exchange].get(key)
-        if subscribers:
-            subscribers.append(subscriber)
-        else:
-            self.subscribers[exchange][key] = [subscriber]
-            self._bind_queue(exchange, key, maxsize, flow_control)
-            self._add_notifier(exchange, key)
+    def declare_exchange(self, name: str) -> Exchange:
+        exchange = self.exchanges.get(name)
+        if not exchange:
+            exchange = Exchange(name)
+            self.exchanges[name] = exchange
+        return exchange
 
-    def unsubscribe(self, subscriber, key, exchange='default'):
-        subscribers = self.subscribers[exchange].get(key)
-        if not subscribers:
-            raise RuntimeError(
-                f'There is no subscriber {subscriber} for {exchange}.{key}')
-        subscribers.remove(subscriber)
-        if not subscribers:
-            self._unbind_queue(exchange, key)
-            self._remove_notifier(exchange, key)
+    def declare_queue(self, name: str, **props) -> Queue:
 
-    async def publish(self, msg, key=None, exchange='default'):
-        if key is None:
-            key = type(msg)
-        queue = self.exchanges[exchange].get(key)
-        if queue:
-            await queue.put(msg)
+        queue = self.queues.get(name)
+        if not queue:
+            queue = Queue(name=name, **props)
+            self.queues[name] = queue
+        return queue
 
-    def publish_nowait(self, msg, key=None, exchange='default'):
-        if key is None:
-            key = type(msg)
-        queue = self.exchanges[exchange].get(key)
-        if queue:
-            queue.put_nowait(msg)
-
-    def _add_notifier(self, exchange, key):
-        notifier = self.notify_loop(exchange, key)
-        self.notifiers[exchange][key] = asyncio.ensure_future(notifier)
-
-    def _remove_notifier(self, exchange, key):
-        notifier = self.notifiers[exchange].pop(key)
-        if notifier:
-            notifier.cancel()
-
-    def _bind_queue(self, exchange, key, maxsize, flow_control):
-        queue = DynamicBoundedManualAcknowledgeQueue(maxsize, flow_control)
-        self.exchanges[exchange][key] = queue
-
-    def _unbind_queue(self, exchange, key):
-        self.exchanges[exchange].pop(key)
-
-    async def _notify(self, callbacks, queue, exchange, key):
-        notify_task = asyncio.gather(*callbacks)
+    async def delete_exchange(self, name: str):
         try:
-            self.notify_tasks.add(notify_task)
-            await notify_task
-            queue.ack()
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            queue.nack()
-            self.log.error(
-                f'Failed to process message {exchange}.{key}: '
-                f'one of subscribers raises {short_type_name(e)}')
-        finally:
-            self.notify_tasks.remove(notify_task)
+            exchange = self.exchanges.pop(name)
+            await exchange.release()
+        except KeyError:
+            raise ExchangeDoesNotExist(name)
 
-    async def notify_loop(self, exchange, key):
-        queue = self.exchanges[exchange][key]
-        while not self.is_stopping():
-            msg = await queue.get()
-            callbacks = [subscriber(msg) for subscriber
-                         in self.subscribers[exchange].get(key, [])]
-            if callbacks:
-                asyncio.ensure_future(
-                    self._notify(callbacks, queue, exchange, key))
+    def stop(self):
+        for exchange in self.exchanges.values():
+            exchange.release()
+        for queue in self.queues.values():
+            queue.close()
+        self.exchanges = {}
+        self.queues = {}
+        self.consumers = {}
+
+    def consume(self,
+                key: Hashable,
+                queue_name: str = None,
+                exchange_name: str = DEFAULT,
+                max_queue_size: int = UNLIMITED,
+                flow_control: bool = True):
+
+        # TODO: возвращать асинхронный контекстный менеджер (консьюмер)
+        #  и удалять все созданное после выхода из него
+        raise NotImplementedError
+
+    async def publish(self,
+                      msg: Any,
+                      key: Optional[Hashable] = None,
+                      exchange_name: str = DEFAULT):
+        try:
+            exchange = self.exchanges[exchange_name]
+        except KeyError:
+            raise ExchangeDoesNotExist(exchange_name)
+
+        await exchange.publish(msg, key)
+
+    def publish_nowait(self,
+                       msg: Any,
+                       key: Optional[Hashable] = None,
+                       exchange_name: str = DEFAULT):
+
+        try:
+            exchange = self.exchanges[exchange_name]
+        except KeyError:
+            raise ExchangeDoesNotExist(exchange_name)
+
+        exchange.publish_nowait(msg, key)
 
 
 broker = Broker()
