@@ -6,7 +6,7 @@ from setuptools import setup, find_packages
 setup(
     name="aiobroker",
     version="0.3",
-    description="Message broker for the communication between the components",
+    description="Message broker to organize the communication of components with each other",
     platforms="all",
     classifiers=[
         "License :: OSI Approved :: Apache Software License",
