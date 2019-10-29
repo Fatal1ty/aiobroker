@@ -122,7 +122,6 @@ class Broker:
         return exchange
 
     def declare_queue(self, name: str, **props) -> Queue:
-
         queue = self.queues.get(name)
         if not queue:
             queue = Queue(name=name, **props)
