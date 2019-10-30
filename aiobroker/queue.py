@@ -39,7 +39,6 @@ class DynamicBoundedManualAcknowledgeQueue(Queue):
         self.auto_delete = auto_delete
         self.ttl = ttl
         self._flow_control = flow_control
-        self.__closed = False
         self.ack_t = time.time()
         self.ack_c = 0
         self.nack_c = 0
@@ -190,7 +189,6 @@ class DynamicBoundedManualAcknowledgeQueue(Queue):
             consumer.cancel()
         if self.ttl:
             self.expiration_task.cancel()
-        self.__closed = True
 
     def __on_message_processed(self, fut, on_error=None):
         # type: (Future, Optional[Callable[[Exception], Any]]) -> NoReturn
@@ -218,7 +216,7 @@ class DynamicBoundedManualAcknowledgeQueue(Queue):
     async def __remove_expired_messages(self):
         delay = self.ttl / 10
         with suppress(asyncio.CancelledError):
-            while not self.__closed:
+            while True:
                 expiration_time = time.time() - self.ttl
                 while True:
                     try:
