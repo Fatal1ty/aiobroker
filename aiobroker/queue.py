@@ -224,6 +224,7 @@ class DynamicBoundedManualAcknowledgeQueue(Queue):
                         message, put_time = self._queue[0]
                         if put_time < expiration_time:
                             self.get_nowait()
+                            self.nack()
                         else:
                             break
                     except IndexError:
